@@ -58,7 +58,7 @@ jobs:
         run: terraform -chdir=${{ env.TF_ROOT }} output -json > state1-outputs.json
 
       - name: Upload outputs artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: state1-outputs
           path: state1-outputs.json
