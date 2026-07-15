@@ -79,8 +79,7 @@ module "postgresql" {
   log_analytics_workspace_id     = var.diagnostics_log_analytics_workspace_id
 
   enable_resource_locks = var.enable_resource_locks
-  tags  tenant_id              = var.tenant_id
-  entra_                = local.tags
+  tags                  = local.tags
 
   depends_on = [module.private_dns]
 }
