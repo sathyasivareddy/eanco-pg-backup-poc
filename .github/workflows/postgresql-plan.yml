@@ -78,7 +78,7 @@ jobs:
         # sourced from Key Vault in a preceding step when password auth is used.
 
       - name: Upload plan artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: state1-tfplan
           path: ${{ env.TF_ROOT }}/tfplan

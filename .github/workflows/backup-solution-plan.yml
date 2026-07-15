@@ -74,7 +74,7 @@ jobs:
         run: terraform -chdir=${{ env.TF_ROOT }} plan -input=false -out=tfplan
 
       - name: Upload plan artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: state2-tfplan
           path: ${{ env.TF_ROOT }}/tfplan
