@@ -34,7 +34,7 @@ jobs:
     outputs:
       image_digest: ${{ steps.push.outputs.digest }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: ShellCheck scripts
         uses: ludeeus/action-shellcheck@master
