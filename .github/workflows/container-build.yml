@@ -45,7 +45,7 @@ jobs:
         run: docker build -t "${IMAGE_REPO}:${GITHUB_SHA}" src/
 
       - name: Trivy image scan
-        uses: aquasecurity/trivy-action@0.24.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: "${{ env.IMAGE_REPO }}:${{ github.sha }}"
           format: table
@@ -54,7 +54,7 @@ jobs:
           severity: CRITICAL,HIGH
 
       - name: Generate SBOM (Trivy)
-        uses: aquasecurity/trivy-action@0.24.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: image
           image-ref: "${{ env.IMAGE_REPO }}:${{ github.sha }}"
