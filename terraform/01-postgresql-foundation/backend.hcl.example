@@ -1,0 +1,10 @@
+# Example backend configuration for STATE 1.
+# Copy to backend.hcl and fill approved values (backend.hcl is gitignored).
+# Init with: terraform init -backend-config=backend.hcl
+#
+# Authentication: Azure AD / OIDC only (no account keys, no SAS).
+resource_group_name  = "WW-Eanco-tfstate-RG"       # backend RG (created by scripts/bootstrap-backend.sh)
+storage_account_name = "steancotfstatedev"          # backend storage account (globally unique)
+container_name       = "tfstate"                    # backend blob container
+use_azuread_auth     = true                          # use Azure AD auth instead of account key
+# subscription_id / tenant_id are provided via ARM_SUBSCRIPTION_ID / ARM_TENANT_ID env vars

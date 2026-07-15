@@ -1,0 +1,91 @@
+# =============================================================================
+# container-build.yml — build, scan and push the backup image to ACR by digest.
+# Uses SP client-secret + ACR token via `az acr login` (no admin creds). Generates SBOM.
+# =============================================================================
+name: container-build
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - ".github/workflows/container-build.yml"
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        default: "dev"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: container-build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE_REPO: eanco-pg-backup
+
+jobs:
+  build-scan-push:
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+    outputs:
+      image_digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: ShellCheck scripts
+        uses: ludeeus/action-shellcheck@master
+        with:
+          scandir: "./src"
+
+      - name: Build image
+        run: docker build -t "${IMAGE_REPO}:${GITHUB_SHA}" src/
+
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: "${{ env.IMAGE_REPO }}:${{ github.sha }}"
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          severity: CRITICAL,HIGH
+
+      - name: Generate SBOM (Trivy)
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: image
+          image-ref: "${{ env.IMAGE_REPO }}:${{ github.sha }}"
+          format: cyclonedx
+          output: sbom.cdx.json
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.cdx.json
+          retention-days: 30
+
+      - name: Azure login (service principal)
+        run: |
+          az login --service-principal \
+            -u "${{ vars.AZURE_CLIENT_ID }}" \
+            -p "${{ secrets.AZURE_CLIENT_SECRET }}" \
+            --tenant "${{ vars.AZURE_TENANT_ID }}" >/dev/null
+          az account set --subscription "${{ vars.AZURE_SUBSCRIPTION_ID }}"
+
+      - name: ACR login
+        run: az acr login --name "${{ vars.ACR_NAME }}"
+
+      - name: Tag + push by digest
+        id: push
+        run: |
+          set -Eeuo pipefail
+          FQ="${{ vars.ACR_LOGIN_SERVER }}/${IMAGE_REPO}:${GITHUB_SHA}"
+          docker tag "${IMAGE_REPO}:${GITHUB_SHA}" "$FQ"
+          docker push "$FQ"
+          DIGEST="$(docker inspect --format='{{index .RepoDigests 0}}' "$FQ")"
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "Pushed: ${DIGEST}"

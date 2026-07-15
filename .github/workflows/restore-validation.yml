@@ -1,0 +1,72 @@
+# =============================================================================
+# restore-validation.yml — run the restore-test job against a NON-PROD test DB.
+# =============================================================================
+name: restore-validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        default: "dev"
+      test_database:
+        description: "Non-production test database name"
+        required: true
+        default: "eanco_backup_demo_restoretest"
+      blob_name:
+        description: "Backup blob to restore (leave blank for latest)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: restore-validation-${{ github.event.inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  restore-test:
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Guard against production-looking target
+        run: |
+          case "${{ github.event.inputs.test_database }}" in
+            *prod*|*production*) echo "Refusing production-looking DB"; exit 1;;
+          esac
+
+      - name: Azure login (service principal)
+        run: |
+          az login --service-principal \
+            -u "${{ vars.AZURE_CLIENT_ID }}" \
+            -p "${{ secrets.AZURE_CLIENT_SECRET }}" \
+            --tenant "${{ vars.AZURE_TENANT_ID }}" >/dev/null
+          az account set --subscription "${{ vars.AZURE_SUBSCRIPTION_ID }}"
+
+      - name: Resolve latest blob if not provided
+        id: blob
+        run: |
+          set -Eeuo pipefail
+          BLOB="${{ github.event.inputs.blob_name }}"
+          if [ -z "$BLOB" ]; then
+            BLOB="$(az storage blob list \
+              --account-name "${{ vars.STORAGE_ACCOUNT }}" \
+              --container-name "${{ vars.BACKUP_CONTAINER }}" --auth-mode login \
+              --query "sort_by([?ends_with(name, '.dump')], &properties.lastModified)[-1].name" -o tsv)"
+          fi
+          echo "name=${BLOB}" >> "$GITHUB_OUTPUT"
+
+      - name: Start restore-validation job execution
+        run: |
+          set -Eeuo pipefail
+          az containerapp job start \
+            --name "${{ vars.JOB_NAME }}" \
+            --resource-group "${{ vars.RESOURCE_GROUP }}" \
+            --env-vars "MODE=restore-test" \
+                       "RESTORE_TEST_DATABASE=${{ github.event.inputs.test_database }}" \
+                       "RESTORE_BLOB_NAME=${{ steps.blob.outputs.name }}" \
+            --query name -o tsv

@@ -1,0 +1,62 @@
+# =============================================================================
+# manual-backup.yml — trigger one backup job execution on demand (control plane).
+# =============================================================================
+name: manual-backup
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        default: "dev"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: manual-backup-${{ github.event.inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  run-backup:
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login (service principal)
+        run: |
+          az login --service-principal \
+            -u "${{ vars.AZURE_CLIENT_ID }}" \
+            -p "${{ secrets.AZURE_CLIENT_SECRET }}" \
+            --tenant "${{ vars.AZURE_TENANT_ID }}" >/dev/null
+          az account set --subscription "${{ vars.AZURE_SUBSCRIPTION_ID }}"
+
+      - name: Start backup job
+        id: start
+        run: |
+          set -Eeuo pipefail
+          EXEC="$(az containerapp job start \
+            --name "${{ vars.JOB_NAME }}" \
+            --resource-group "${{ vars.RESOURCE_GROUP }}" \
+            --query name -o tsv)"
+          echo "execution=${EXEC}" >> "$GITHUB_OUTPUT"
+          echo "Started ${EXEC}"
+
+      - name: Wait + report status
+        run: |
+          set -Eeuo pipefail
+          EXEC="${{ steps.start.outputs.execution }}"
+          for i in $(seq 1 60); do
+            STATUS="$(az containerapp job execution show \
+              --name "${{ vars.JOB_NAME }}" --resource-group "${{ vars.RESOURCE_GROUP }}" \
+              --job-execution-name "$EXEC" --query "properties.status" -o tsv || echo Unknown)"
+            echo "[$i] status=$STATUS"
+            case "$STATUS" in
+              Succeeded) echo "Backup succeeded"; exit 0;;
+              Failed|Degraded) echo "Backup failed"; exit 1;;
+            esac
+            sleep 15
+          done
+          echo "Timed out waiting for job completion"; exit 1

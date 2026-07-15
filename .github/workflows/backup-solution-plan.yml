@@ -1,0 +1,81 @@
+# =============================================================================
+# backup-solution-plan.yml — validate + plan STATE 2 (backup solution).
+# Confirms State 1 resource IDs are provided before planning.
+# =============================================================================
+name: backup-solution-plan
+
+on:
+  pull_request:
+    paths:
+      - "terraform/02-postgresql-backup-solution/**"
+      - ".github/workflows/backup-solution-plan.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: terraform-postgresql-backup-${{ github.event.inputs.environment || 'dev' }}
+  cancel-in-progress: false
+
+env:
+  TF_ROOT: terraform/02-postgresql-backup-solution
+  ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+  ARM_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+  ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+jobs:
+  validate-and-plan:
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+
+      - name: Terraform fmt (check)
+        run: terraform -chdir=${{ env.TF_ROOT }} fmt -check -recursive
+
+      - name: Terraform init (no backend)
+        run: terraform -chdir=${{ env.TF_ROOT }} init -backend=false
+
+      - name: Terraform validate
+        run: terraform -chdir=${{ env.TF_ROOT }} validate
+
+      - name: tflint
+        uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: latest
+      - run: tflint --chdir=${{ env.TF_ROOT }} --init && tflint --chdir=${{ env.TF_ROOT }}
+
+      - name: Checkov (IaC scan)
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: ${{ env.TF_ROOT }}
+          quiet: true
+          soft_fail: false
+
+      - name: Azure login (service principal)
+        run: |
+          az login --service-principal \
+            -u "${{ vars.AZURE_CLIENT_ID }}" \
+            -p "${{ secrets.AZURE_CLIENT_SECRET }}" \
+            --tenant "${{ vars.AZURE_TENANT_ID }}" >/dev/null
+          az account set --subscription "${{ vars.AZURE_SUBSCRIPTION_ID }}"
+
+      - name: Terraform init (backend)
+        run: terraform -chdir=${{ env.TF_ROOT }} init -backend-config=backend.hcl
+
+      - name: Terraform plan
+        run: terraform -chdir=${{ env.TF_ROOT }} plan -input=false -out=tfplan
+
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: state2-tfplan
+          path: ${{ env.TF_ROOT }}/tfplan
+          retention-days: 5

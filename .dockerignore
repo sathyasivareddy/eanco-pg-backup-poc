@@ -1,0 +1,27 @@
+# Only the backup runtime context under src/ is needed by the image build.
+# Exclude everything not required to keep image small and free of secrets.
+**
+!src/entrypoint.sh
+!src/backup.sh
+!src/restore-test.sh
+!src/health-check.sh
+
+# Never allow secrets or state into the build context
+**/*.tfstate
+**/*.tfstate.*
+**/*.tfvars
+**/*.auto.tfvars
+**/.env
+**/.env.*
+**/*.pem
+**/*.key
+**/*.pgpass
+**/backend.hcl
+**/secrets/
+.git/
+.github/
+docs/
+terraform/
+scripts/
+database/
+README.md

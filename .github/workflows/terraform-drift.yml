@@ -1,0 +1,48 @@
+# =============================================================================
+# terraform-drift.yml — scheduled drift detection for both states (plan only).
+# Never applies or destroys. Opens no changes; reports drift as a failed run.
+# =============================================================================
+name: terraform-drift
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"   # Mondays 06:00 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    environment: dev
+    strategy:
+      fail-fast: false
+      matrix:
+        root:
+          - terraform/01-postgresql-foundation
+          - terraform/02-postgresql-backup-solution
+    concurrency:
+      group: terraform-drift-${{ matrix.root }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+
+      - name: Azure login (service principal)
+        run: |
+          az login --service-principal \
+            -u "${{ vars.AZURE_CLIENT_ID }}" \
+            -p "${{ secrets.AZURE_CLIENT_SECRET }}" \
+            --tenant "${{ vars.AZURE_TENANT_ID }}" >/dev/null
+          az account set --subscription "${{ vars.AZURE_SUBSCRIPTION_ID }}"
+
+      - name: Init
+        run: terraform -chdir=${{ matrix.root }} init -backend-config=backend.hcl
+
+      - name: Plan (detailed exit code)
+        run: terraform -chdir=${{ matrix.root }} plan -input=false -detailed-exitcode
+        # exit 0 = no drift, 2 = drift detected (fails the run), 1 = error.

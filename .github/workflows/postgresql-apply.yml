@@ -1,0 +1,65 @@
+# =============================================================================
+# postgresql-apply.yml — apply STATE 1 after manual approval (protected env).
+# =============================================================================
+name: postgresql-apply
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        default: "dev"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: terraform-postgresql-foundation-${{ github.event.inputs.environment }}
+  cancel-in-progress: false
+
+env:
+  TF_ROOT: terraform/01-postgresql-foundation
+  ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+  ARM_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+  ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    # Protected environment enforces required reviewers before this job runs.
+    environment: ${{ github.event.inputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+
+      - name: Azure login (service principal)
+        run: |
+          az login --service-principal \
+            -u "${{ vars.AZURE_CLIENT_ID }}" \
+            -p "${{ secrets.AZURE_CLIENT_SECRET }}" \
+            --tenant "${{ vars.AZURE_TENANT_ID }}" >/dev/null
+          az account set --subscription "${{ vars.AZURE_SUBSCRIPTION_ID }}"
+
+      - name: Terraform init
+        run: terraform -chdir=${{ env.TF_ROOT }} init -backend-config=backend.hcl
+
+      - name: Terraform plan
+        run: terraform -chdir=${{ env.TF_ROOT }} plan -input=false -out=tfplan
+
+      - name: Terraform apply
+        run: terraform -chdir=${{ env.TF_ROOT }} apply -input=false tfplan
+
+      - name: Publish non-secret outputs
+        run: terraform -chdir=${{ env.TF_ROOT }} output -json > state1-outputs.json
+
+      - name: Upload outputs artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: state1-outputs
+          path: state1-outputs.json
+          retention-days: 30

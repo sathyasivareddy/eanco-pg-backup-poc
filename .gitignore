@@ -1,0 +1,56 @@
+# Terraform
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+*.tfvars
+*.auto.tfvars
+!*.tfvars.example
+!*.auto.tfvars.example
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+*.tfplan
+*.tfplan.*
+.terraform.lock.hcl.bak
+
+# Backend configs may contain account names (not secrets, but keep local)
+backend.hcl
+!backend.hcl.example
+
+# Env / secrets — never commit
+.env
+.env.*
+*.pem
+*.key
+*.pfx
+*.p12
+*.pgpass
+pgpass
+secrets/
+*.secret
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.swp
+*~
+
+# Build / test artifacts
+dist/
+build/
+coverage/
+*.log
+sbom*.json
+trivy-results*.json
+checkov-results*.json
+
+# Docker
+*.tar
