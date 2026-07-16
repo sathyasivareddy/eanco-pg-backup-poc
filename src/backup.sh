@@ -71,13 +71,22 @@ trap 'exit 143' SIGTERM SIGINT
 
 die() { local code="$1" stage="$2" msg="$3"; log "$stage" "failed" "$code" "$msg"; exit "$code"; }
 
-# ----------------------------- IMDS token -----------------------------------
+# ----------------------------- managed identity token -----------------------
 get_token() {
   # get_token <resource> -> prints access_token
+  # Supports both the Container Apps/App Service identity endpoint
+  # (IDENTITY_ENDPOINT + IDENTITY_HEADER) and the VM/VMSS IMDS endpoint.
   local resource="$1" resp token
-  resp="$(curl -sf -H "Metadata: true" --max-time 10 \
-    "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=${resource}&client_id=${AZURE_CLIENT_ID}")" \
-    || return 1
+  if [[ -n "${IDENTITY_ENDPOINT:-}" && -n "${IDENTITY_HEADER:-}" ]]; then
+    resp="$(curl -sf --max-time 10 \
+      -H "X-IDENTITY-HEADER: ${IDENTITY_HEADER}" \
+      "${IDENTITY_ENDPOINT}?api-version=2019-08-01&resource=${resource}&client_id=${AZURE_CLIENT_ID}")" \
+      || return 1
+  else
+    resp="$(curl -sf -H "Metadata: true" --max-time 10 \
+      "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=${resource}&client_id=${AZURE_CLIENT_ID}")" \
+      || return 1
+  fi
   token="$(printf '%s' "$resp" | jq -r '.access_token // empty')"
   [[ -n "$token" ]] || return 1
   printf '%s' "$token"
