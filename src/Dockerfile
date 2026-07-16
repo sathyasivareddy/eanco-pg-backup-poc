@@ -44,7 +44,14 @@ RUN set -eux; \
 WORKDIR /work
 
 # Copy scripts (owned by non-root, read+exec only).
-COPY --chown=backup:backup --chmod=0555 entrypoint.sh backup.sh restore-test.sh health-check.sh /usr/local/bin/
+# Note: --chmod is intentionally not used on COPY because ACR classic tasks
+# (az acr build) build without BuildKit. Set permissions with an explicit RUN.
+COPY --chown=backup:backup entrypoint.sh backup.sh restore-test.sh health-check.sh /usr/local/bin/
+RUN chmod 0555 \
+        /usr/local/bin/entrypoint.sh \
+        /usr/local/bin/backup.sh \
+        /usr/local/bin/restore-test.sh \
+        /usr/local/bin/health-check.sh
 
 USER 10001:10001
 
