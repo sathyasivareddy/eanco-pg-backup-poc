@@ -1,7 +1,9 @@
 # syntax=docker/dockerfile:1
 # =============================================================================
 # Backup container for PostgreSQL pg_dump over private VNet.
-# - PostgreSQL 16 client (pg_dump/pg_restore/psql)
+# - PostgreSQL 18 client (pg_dump/pg_restore/psql) - MUST match/exceed the
+#   major version of the target PostgreSQL Flexible Server(s). pg_dump refuses
+#   to run against a server whose major version is newer than the client.
 # - Non-root, read-only root FS friendly (writes only to /tmp)
 # - No secrets baked in; credentials fetched at runtime from Key Vault via UAMI
 #
@@ -20,10 +22,10 @@ LABEL org.opencontainers.image.title="eanco-pg-backup" \
       org.opencontainers.image.source="https://github.com/<org>/<repo>"
 
 # Install only required packages, then remove caches.
-# postgresql16-client provides pg_dump/pg_restore/psql matching server v16.
+# postgresql18-client provides pg_dump/pg_restore/psql matching server v18.
 RUN set -eux; \
     apk add --no-cache \
-        postgresql16-client \
+        postgresql18-client \
         bash \
         curl \
         jq \
