@@ -12,7 +12,7 @@
 # Do not use floating tags in production.
 # =============================================================================
 
-FROM alpine:3.20 AS base
+FROM alpine:3.22 AS base
 
 # OCI labels
 LABEL org.opencontainers.image.title="eanco-pg-backup" \
