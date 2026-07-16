@@ -23,7 +23,13 @@ LABEL org.opencontainers.image.title="eanco-pg-backup" \
 
 # Install only required packages, then remove caches.
 # postgresql18-client provides pg_dump/pg_restore/psql matching server v18.
+# apk upgrade first: alpine:edge base layers can lag behind the live package
+# index, causing musl/libc ABI mismatches ("symbol not found") for newly
+# installed packages built against the newer index. Upgrading first keeps the
+# whole rootfs consistent with what gets installed.
 RUN set -eux; \
+    apk update; \
+    apk upgrade --no-cache; \
     apk add --no-cache \
         postgresql18-client \
         bash \
