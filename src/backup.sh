@@ -98,6 +98,9 @@ sanitize_path_segment() {
   printf '%s' "${1:-}" | tr -cd 'A-Za-z0-9._-' | cut -c1-128
 }
 
+# Builds the destination blob path:
+#   <environment>/<server>/<database>/<yyyy>/<mm>/<dd>/<database>_<timestamp>_<execution_id>.dump
+# Date-partitioned so backups are easy to browse/retain/expire by day.
 build_blob_name() {
   local env srv db ts
   env="$(sanitize_path_segment "$ENVIRONMENT")"
@@ -111,17 +114,21 @@ build_blob_name() {
 }
 
 # ----------------------------- steps ----------------------------------------
+# Validate the caller-supplied settings before doing any real work (fail fast).
 step_validate_input() {
   log "validate_input" "started"
-  [[ "$PGPORT" =~ ^[0-9]+$ ]] || die 10 "validate_input" "PGPORT not numeric"
-  case "$PGSSLMODE" in require|verify-ca|verify-full) ;; *) die 10 "validate_input" "Invalid PGSSLMODE";; esac
+  [[ "$PGPORT" =~ ^[0-9]+$ ]] || die 10 "validate_input" "PGPORT not numeric"   # port must be numeric
+  case "$PGSSLMODE" in require|verify-ca|verify-full) ;; *) die 10 "validate_input" "Invalid PGSSLMODE";; esac   # TLS must be enforced
   log "validate_input" "success"
 }
 
+# Fetch the DB password from Key Vault using the managed identity, then write it
+# to a locked-down (0600) PGPASSFILE so the password never appears on the command
+# line, in env vars, or in logs.
 step_fetch_secret() {
   log "keyvault" "started"
   local kv_token secret_resp password
-  kv_token="$(get_token "https://vault.azure.net")" || die 20 "keyvault" "Failed to obtain KV token via IMDS"
+  kv_token="$(get_token "https://vault.azure.net")" || die 20 "keyvault" "Failed to obtain KV token via IMDS"   # AAD token for Key Vault
   secret_resp="$(curl -sf --max-time 15 -H "Authorization: Bearer ${kv_token}" \
     "${KEY_VAULT_URI%/}/secrets/${KEY_VAULT_SECRET_NAME}?api-version=7.4")" \
     || die 20 "keyvault" "Failed to read secret from Key Vault"
@@ -135,6 +142,7 @@ step_fetch_secret() {
   log "keyvault" "success"
 }
 
+# Confirm the PostgreSQL host name resolves (proves private DNS is working).
 step_validate_dns() {
   log "dns" "started"
   # getent/nslookup may be absent; use curl-based resolution via bash /dev/tcp fallback.
@@ -147,12 +155,16 @@ step_validate_dns() {
   log "dns" "success"
 }
 
+# Confirm we can open a TCP connection to the DB port (proves network reachability
+# over the private endpoint before attempting an actual DB login).
 step_validate_tcp() {
   log "tcp" "started"
   timeout 10 bash -c ">/dev/tcp/${PGHOST}/${PGPORT}" 2>/dev/null || die 40 "tcp" "TCP connect to 5432 failed"
   log "tcp" "success"
 }
 
+# Run a trivial authenticated query (SELECT 1) to prove the credentials, TLS, and
+# target database are all valid before starting the (expensive) dump.
 step_probe_query() {
   log "probe_query" "started"
   PGSSLMODE="$PGSSLMODE" psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" \
@@ -160,6 +172,7 @@ step_probe_query() {
   log "probe_query" "success"
 }
 
+# Ensure there is enough scratch space for the single streaming block buffer.
 step_check_tmp() {
   log "check_tmp" "started"
   local avail_kb
@@ -169,8 +182,11 @@ step_check_tmp() {
   log "check_tmp" "success"
 }
 
+# Helper: percent-encode a string so it is safe to place in a URL query value.
 url_encode() { jq -rn --arg s "$1" '$s|@uri'; }
 
+# Helper: upload a small local file as a single block blob (used for the .sha256
+# sidecar). Large dumps use the streaming block path in step_stream instead.
 put_blob() {
   # put_blob <local_file> <blob_name> <content_type> [extra metadata headers...]
   local file="$1" blob="$2" ctype="$3"; shift 3
@@ -209,46 +225,59 @@ step_stream() {
 
   : > "$blocklist_file"
   rm -f "$shafifo"; mkfifo "$shafifo"
+  # Background process: hashes the stream live (as bytes flow) so we never need
+  # the whole dump on disk to compute its SHA-256.
   ( sha256sum < "$shafifo" | awk '{print $1}' > "$CHECKSUM_FILE" ) &
   local sha_pid=$!
 
-  # pg_dump -> tee: one copy to the sha fifo, one to fd 3 for the chunk loop.
-  exec 3< <(PGSSLMODE="$PGSSLMODE" pg_dump -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" \
-              -w -Fc -Z 6 2> "${WORKDIR}/pg_dump.err" | tee "$shafifo")
+  # Run pg_dump and fan its stdout out two ways with tee:
+  #   - one copy -> the fifo (consumed by sha256sum above)
+  #   - one copy -> fd 3 (consumed by the chunk loop below)
+  # We also capture pg_dump's REAL exit code into pg_dump.rc so a mid-stream
+  # failure can never be silently committed as a truncated backup.
+  exec 3< <( { PGSSLMODE="$PGSSLMODE" pg_dump -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" \
+                 -w -Fc -Z 6 2> "${WORKDIR}/pg_dump.err"; echo $? > "${WORKDIR}/pg_dump.rc"; } | tee "$shafifo")
 
   local i=0 total=0 raw_id enc_id sz attempt ok
   while :; do
-    head -c "$block_size" <&3 > "$block_file" || true
+    head -c "$block_size" <&3 > "$block_file" || true   # read up to 100 MiB from the stream
     sz="$(stat -c %s "$block_file" 2>/dev/null || echo 0)"
-    [[ "$sz" -gt 0 ]] || break
+    [[ "$sz" -gt 0 ]] || break                          # 0 bytes = end of stream -> done
 
     # Refresh the storage token every ~3 GB so long streams never hit expiry.
     if (( i > 0 && i % 30 == 0 )); then
       token="$(get_token "https://storage.azure.com")" || die 70 "upload" "token refresh failed at block ${i}"
     fi
 
-    raw_id="$(printf 'block-%09d' "$i" | base64 -w0)"   # fixed-length, base64
-    enc_id="$(url_encode "$raw_id")"
+    raw_id="$(printf 'block-%09d' "$i" | base64 -w0)"   # unique, fixed-length block ID (base64)
+    enc_id="$(url_encode "$raw_id")"                    # URL-encode it for the query string
 
     attempt=0; ok=0
     while [[ $attempt -lt 3 ]]; do
+      # Put Block: upload this 100 MiB chunk as a STAGED (uncommitted) block.
       if curl -sf --max-time 600 -X PUT \
           -H "Authorization: Bearer ${token}" \
           -H "x-ms-version: ${STORAGE_API_VERSION}" \
           -H "x-ms-date: $(date -u '+%a, %d %b %Y %H:%M:%S GMT')" \
           --data-binary "@${block_file}" \
           "${url}?comp=block&blockid=${enc_id}" >/dev/null; then ok=1; break; fi
-      attempt=$((attempt+1)); sleep 3
+      attempt=$((attempt+1)); sleep 3                    # transient failure -> retry (3x)
     done
     [[ $ok -eq 1 ]] || die 70 "upload" "Put Block failed at block ${i}"
 
-    printf '<Latest>%s</Latest>' "$raw_id" >> "$blocklist_file"
+    printf '<Latest>%s</Latest>' "$raw_id" >> "$blocklist_file"   # remember this block's ID, in order
     i=$((i+1)); total=$(( total + sz ))
   done
   exec 3<&- || true
-  wait "$sha_pid" 2>/dev/null || true
+  wait "$sha_pid" 2>/dev/null || true                   # let the live sha256sum finish
   rm -f "$block_file" "$shafifo"
 
+  # Refuse to commit if pg_dump did not exit cleanly (guards against a truncated
+  # dump being finalized). We check both its real exit code and its stderr.
+  local pgdump_rc; pgdump_rc="$(cat "${WORKDIR}/pg_dump.rc" 2>/dev/null || echo 1)"
+  if [[ "$pgdump_rc" != "0" ]]; then
+    die 50 "pg_dump" "pg_dump exited ${pgdump_rc} (not committing, possible truncation): $(sanitize "$(tail -n1 "${WORKDIR}/pg_dump.err" 2>/dev/null)")"
+  fi
   if grep -qiE 'error|fatal' "${WORKDIR}/pg_dump.err" 2>/dev/null; then
     die 50 "pg_dump" "pg_dump reported: $(sanitize "$(tail -n1 "${WORKDIR}/pg_dump.err")")"
   fi
@@ -260,6 +289,8 @@ step_stream() {
   log "checksum" "success"
 
   # Commit the uploaded blocks into the final blob (Put Block List).
+  # Only reached if pg_dump exited 0 and every block uploaded — so a truncated
+  # or partial dump is never finalized.
   log "upload" "started"
   token="$(get_token "https://storage.azure.com")" || die 70 "upload" "storage token failed (commit)"
   curl -sf --max-time 120 -X PUT \
@@ -284,6 +315,8 @@ step_stream() {
   log "upload" "success"
 }
 
+# Final sanity check: confirm the committed blob actually exists in storage
+# (a HEAD request) before declaring the backup complete.
 step_verify_blob() {
   log "verify_blob" "started"
   local token url code
@@ -295,6 +328,8 @@ step_verify_blob() {
   log "verify_blob" "success"
 }
 
+# Runs every stage in order; any step calling die() exits immediately with a
+# categorized error code (see header) and the cleanup trap still fires.
 main() {
   log "start" "started" "" "Backup run starting"
   step_validate_input
