@@ -13,10 +13,10 @@ on:
   workflow_dispatch:      # allow manual runs from the Actions tab
 
 env:
-  ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER }}   # e.g. bdaze1ikpitcr01.azurecr.io
+  ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER }}   # e.g. <registry-name>.azurecr.io
   IMAGE: pg-backup
-  RESOURCE_GROUP: ${{ vars.RESOURCE_GROUP }}       # e.g. BDAZE1IKPITRG01
-  JOB_NAME: ${{ vars.JOB_NAME }}                   # e.g. bdaze1ikpit-pgbackup-job
+  RESOURCE_GROUP: ${{ vars.RESOURCE_GROUP }}       # e.g. <resource-group-name>
+  JOB_NAME: ${{ vars.JOB_NAME }}                   # e.g. <container-apps-job-name>
 
 jobs:
   build-push:

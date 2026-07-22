@@ -164,31 +164,12 @@ step_check_tmp() {
   log "check_tmp" "started"
   local avail_kb
   avail_kb="$(df -Pk "$WORKDIR" | awk 'NR==2{print $4}')"
-  [[ "${avail_kb:-0}" -gt 51200 ]] || die 50 "check_tmp" "Insufficient temp space (<50MB)"
+  # Streaming keeps only ONE ~100 MiB block on disk at a time; require ~300 MiB.
+  [[ "${avail_kb:-0}" -gt 307200 ]] || die 50 "check_tmp" "Insufficient temp space (<300MB) for streaming block buffer"
   log "check_tmp" "success"
 }
 
-step_pg_dump() {
-  log "pg_dump" "started"
-  DUMP_FILE="${WORKDIR}/${PGDATABASE}.dump"
-  # Custom format (-Fc) is compressed and restorable via pg_restore.
-  if ! PGSSLMODE="$PGSSLMODE" pg_dump -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" \
-        -w -Fc -Z 6 -f "$DUMP_FILE" 2> "${WORKDIR}/pg_dump.err"; then
-    die 50 "pg_dump" "pg_dump failed: $(sanitize "$(tail -n1 "${WORKDIR}/pg_dump.err" 2>/dev/null)")"
-  fi
-  [[ -f "$DUMP_FILE" ]] || die 50 "pg_dump" "Dump file missing"
-  BACKUP_SIZE_BYTES="$(stat -c %s "$DUMP_FILE" 2>/dev/null || echo 0)"
-  [[ "${BACKUP_SIZE_BYTES}" -gt 0 ]] || die 50 "pg_dump" "Dump file is empty"
-  log "pg_dump" "success"
-}
-
-step_checksum() {
-  log "checksum" "started"
-  CHECKSUM_FILE="${DUMP_FILE}.sha256"
-  sha256sum "$DUMP_FILE" | awk '{print $1}' > "$CHECKSUM_FILE" || die 60 "checksum" "sha256 failed"
-  [[ -s "$CHECKSUM_FILE" ]] || die 60 "checksum" "Empty checksum"
-  log "checksum" "success"
-}
+url_encode() { jq -rn --arg s "$1" '$s|@uri'; }
 
 put_blob() {
   # put_blob <local_file> <blob_name> <content_type> [extra metadata headers...]
@@ -206,10 +187,86 @@ put_blob() {
     "$url" >/dev/null
 }
 
-step_upload() {
-  log "upload" "started"
+step_stream() {
+  # ---------------------------------------------------------------------------
+  # Streams pg_dump (custom-format, compressed) directly to a block blob.
+  # Only ONE ~100 MiB block is ever written to local disk, so the container
+  # needs no large ephemeral storage regardless of database size. The SHA-256
+  # of the uploaded content is computed inline via a tee'd fifo.
+  # Emits the pg_dump / checksum / upload stages for log continuity.
+  # ---------------------------------------------------------------------------
+  log "pg_dump" "started"
+
+  local block_size=$(( 100 * 1024 * 1024 ))     # 100 MiB per block
+  local block_file="${WORKDIR}/block.bin"
+  local blocklist_file="${WORKDIR}/blocklist.xml"
+  local shafifo="${WORKDIR}/shafifo"
+  CHECKSUM_FILE="${WORKDIR}/dump.sha256"
+
   BLOB_NAME="$(build_blob_name)"
-  put_blob "$DUMP_FILE" "$BLOB_NAME" "application/octet-stream" \
+  local url="${STORAGE_BLOB_ENDPOINT%/}/${STORAGE_CONTAINER_NAME}/${BLOB_NAME}"
+  local token; token="$(get_token "https://storage.azure.com")" || die 70 "upload" "storage token failed"
+
+  : > "$blocklist_file"
+  rm -f "$shafifo"; mkfifo "$shafifo"
+  ( sha256sum < "$shafifo" | awk '{print $1}' > "$CHECKSUM_FILE" ) &
+  local sha_pid=$!
+
+  # pg_dump -> tee: one copy to the sha fifo, one to fd 3 for the chunk loop.
+  exec 3< <(PGSSLMODE="$PGSSLMODE" pg_dump -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" \
+              -w -Fc -Z 6 2> "${WORKDIR}/pg_dump.err" | tee "$shafifo")
+
+  local i=0 total=0 raw_id enc_id sz attempt ok
+  while :; do
+    head -c "$block_size" <&3 > "$block_file" || true
+    sz="$(stat -c %s "$block_file" 2>/dev/null || echo 0)"
+    [[ "$sz" -gt 0 ]] || break
+
+    # Refresh the storage token every ~3 GB so long streams never hit expiry.
+    if (( i > 0 && i % 30 == 0 )); then
+      token="$(get_token "https://storage.azure.com")" || die 70 "upload" "token refresh failed at block ${i}"
+    fi
+
+    raw_id="$(printf 'block-%09d' "$i" | base64 -w0)"   # fixed-length, base64
+    enc_id="$(url_encode "$raw_id")"
+
+    attempt=0; ok=0
+    while [[ $attempt -lt 3 ]]; do
+      if curl -sf --max-time 600 -X PUT \
+          -H "Authorization: Bearer ${token}" \
+          -H "x-ms-version: ${STORAGE_API_VERSION}" \
+          -H "x-ms-date: $(date -u '+%a, %d %b %Y %H:%M:%S GMT')" \
+          --data-binary "@${block_file}" \
+          "${url}?comp=block&blockid=${enc_id}" >/dev/null; then ok=1; break; fi
+      attempt=$((attempt+1)); sleep 3
+    done
+    [[ $ok -eq 1 ]] || die 70 "upload" "Put Block failed at block ${i}"
+
+    printf '<Latest>%s</Latest>' "$raw_id" >> "$blocklist_file"
+    i=$((i+1)); total=$(( total + sz ))
+  done
+  exec 3<&- || true
+  wait "$sha_pid" 2>/dev/null || true
+  rm -f "$block_file" "$shafifo"
+
+  if grep -qiE 'error|fatal' "${WORKDIR}/pg_dump.err" 2>/dev/null; then
+    die 50 "pg_dump" "pg_dump reported: $(sanitize "$(tail -n1 "${WORKDIR}/pg_dump.err")")"
+  fi
+  [[ "$i" -gt 0 ]] || die 50 "pg_dump" "No data produced by pg_dump"
+  BACKUP_SIZE_BYTES="$total"
+  log "pg_dump" "success"
+
+  [[ -s "$CHECKSUM_FILE" ]] || die 60 "checksum" "Inline sha256 not produced"
+  log "checksum" "success"
+
+  # Commit the uploaded blocks into the final blob (Put Block List).
+  log "upload" "started"
+  token="$(get_token "https://storage.azure.com")" || die 70 "upload" "storage token failed (commit)"
+  curl -sf --max-time 120 -X PUT \
+    -H "Authorization: Bearer ${token}" \
+    -H "x-ms-version: ${STORAGE_API_VERSION}" \
+    -H "x-ms-date: $(date -u '+%a, %d %b %Y %H:%M:%S GMT')" \
+    -H "x-ms-blob-content-type: application/octet-stream" \
     -H "x-ms-meta-environment: ${ENVIRONMENT}" \
     -H "x-ms-meta-database: ${PGDATABASE}" \
     -H "x-ms-meta-server: ${PG_SERVER_NAME}" \
@@ -217,10 +274,13 @@ step_upload() {
     -H "x-ms-meta-sha256: $(cat "$CHECKSUM_FILE")" \
     -H "x-ms-meta-retention: ${BACKUP_RETENTION_LABEL}" \
     -H "x-ms-meta-pg_dump_version: ${PG_DUMP_VERSION}" \
-    || die 70 "upload" "Blob upload failed"
+    -H "Content-Type: application/xml" \
+    --data-binary "<?xml version=\"1.0\" encoding=\"utf-8\"?><BlockList>$(cat "$blocklist_file")</BlockList>" \
+    "${url}?comp=blocklist" >/dev/null || die 70 "upload" "Put Block List (commit) failed"
+
+  # Upload the checksum sidecar (tiny).
   put_blob "$CHECKSUM_FILE" "${BLOB_NAME}.sha256" "text/plain" \
-    -H "x-ms-meta-environment: ${ENVIRONMENT}" \
-    || die 70 "upload" "Checksum upload failed"
+    -H "x-ms-meta-environment: ${ENVIRONMENT}" || die 70 "upload" "Checksum sidecar upload failed"
   log "upload" "success"
 }
 
@@ -243,9 +303,7 @@ main() {
   step_validate_tcp
   step_probe_query
   step_check_tmp
-  step_pg_dump
-  step_checksum
-  step_upload
+  step_stream
   step_verify_blob
   log "completed" "success" "" "Backup completed and verified"
   exit 0

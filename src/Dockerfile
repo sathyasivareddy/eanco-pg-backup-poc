@@ -15,7 +15,7 @@
 FROM alpine:edge AS base
 
 # OCI labels
-LABEL org.opencontainers.image.title="eanco-pg-backup" \
+LABEL org.opencontainers.image.title="pg-backup" \
       org.opencontainers.image.description="PostgreSQL pg_dump backup job (private VNet, Managed Identity)" \
       org.opencontainers.image.vendor="WinWire" \
       org.opencontainers.image.licenses="Proprietary" \
